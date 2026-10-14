@@ -1,0 +1,20 @@
+# 环境变量（含 API Key，绝不能提交）
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 本地模型与索引（体积大，不入库）
+models/
+category_faiss_index/
+
+# 运行产物（标注结果 / 日志）
+output/
+
+# IDE
+.idea/
+.vscode/
