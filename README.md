@@ -47,11 +47,14 @@
 ```
 product-annotation-agent/
 ├── annotator.py       # 主程序（标注闭环全流程）
+├── eval.py            # 评测脚本（速度 + 准度）
 ├── embeddings.py      # BGE embedding 封装（首次自动下载，后续离线）
-├── config.py          # 从 .env 读取 API Key
+├── config.py          # 从 .env 读取 API Key（含 DeepSeek 直连配置）
 ├── data/
-│   ├── categories.txt # 候选类别库
-│   └── products.txt   # 待标注商品列表
+│   ├── categories.txt      # 候选类别库
+│   ├── products.txt        # 待标注商品列表
+│   ├── eval_set.json       # 评测集（26 条常规样本，带 ground-truth）
+│   └── eval_set_hard.json  # 困难评测集（含无法归类的样本）
 └── requirements.txt
 ```
 
@@ -78,6 +81,26 @@ product-annotation-agent/
    ```
 
    首次运行会自动下载 BGE 嵌入模型到 `models/`（需能访问 Hugging Face），之后可离线运行。
+
+## 评测（速度 + 准度）
+
+```bash
+python eval.py -e data/eval_set.json        # 常规样本（26 条）
+python eval.py -e data/eval_set_hard.json   # 困难样本（含无法归类）
+```
+
+参考结果（本机实测，受网络延迟影响）：
+
+| 指标 | 常规集 | 困难集 |
+|---|---|---|
+| 样本数 | 26 | 8 |
+| 准确率 | 100%（26/26） | 62.5%（5/8） |
+| 平均耗时 | 1.01 秒/条 | 1.04 秒/条 |
+| 对比纯人工(30s/条) | ~30 倍 | ~29 倍 |
+
+低置信度样本会在报告末尾列出，**附 Top-N 候选及相似度**（检索 `Top-10`，当类别库不足 10 类时显示全部类别）。
+
+> 已知局限：困难集的主要误差来自「LLM 强行归类」——对无法匹配的商品（如充电宝、宠物粮）没有返回"未知"，而是塞进最接近的类别。可通过收紧 prompt、增加"未知"示例、或引入类别覆盖度二次校验来缓解。
 
 ## 输出说明
 

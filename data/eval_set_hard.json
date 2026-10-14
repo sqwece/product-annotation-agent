@@ -1,0 +1,10 @@
+[
+  {"product": "手机壳", "label": "未知"},
+  {"product": "充电宝", "label": "未知"},
+  {"product": "蓝牙耳机", "label": "未知"},
+  {"product": "宠物粮", "label": "未知"},
+  {"product": "沐浴露", "label": "日用品"},
+  {"product": "葡萄", "label": "生鲜"},
+  {"product": "长袖衬衫", "label": "服装"},
+  {"product": "洗碗机", "label": "家电"}
+]

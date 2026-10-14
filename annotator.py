@@ -9,10 +9,10 @@ Product Recognition & Agent-Assisted Annotation
     把「全量人工标注」变成「机器标注 + 少量人工兜底」，从而显著降低人力成本。
 
 标注闭环（Human-in-the-loop）：
-    1. 向量召回   FAISS 检索 Top-K 候选类别（粗筛）
-    2. Agent 标注 LLM 在候选类别中精排，给出类别 + 置信度 + 理由
+    1. 向量召回   FAISS 检索 Top-10 候选类别（粗筛，含相似度分数）
+    2. Agent 标注 LLM 在 Top-5 候选类别中精排，给出类别 + 置信度 + 理由
     3. 置信度门控 高置信度 → 直接入库；低置信度 → 进入人工复核队列
-    4. 人工复核   交互式确认 / 修正（只处理不确定样本，人力消耗最小化）
+    4. 人工复核   交互式确认 / 修正（附 Top-10 候选 + 相似度，只处理不确定样本）
     5. 日志留痕   每次标注写入日志（文本日志 + 结构化审计记录）
     6. 数据集导出 导出最终标注结果，可直接用于下游训练 / 检索
 
@@ -25,6 +25,7 @@ Product Recognition & Agent-Assisted Annotation
     python annotator.py                          # 自动标注 + 交互式人工复核
     python annotator.py --no-review              # 仅自动标注，跳过人工复核
     python annotator.py -p data/products.txt -c data/categories.txt
+    python eval.py                               # 评测：速度 + 准度（见 eval.py）
 """
 
 from __future__ import annotations
@@ -33,6 +34,7 @@ import argparse
 import json
 import logging
 import sys
+import warnings
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -47,6 +49,16 @@ from langchain_openai import ChatOpenAI
 from config import OPENAI_API_KEY
 from embeddings import get_embeddings
 
+# Windows 控制台默认 GBK，强制 UTF-8 输出，避免中文/emoji 打印报错
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+# FAISS 相关性分数可能略微超出 [0,1]，压制无意义的告警
+warnings.filterwarnings("ignore", message=".*Relevance scores.*")
+
 # ========================== 路径与常量 ==========================
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -58,7 +70,7 @@ EMBEDDING_MODEL = "BAAI/bge-small-zh-v1.5"
 LLM_MODEL = "deepseek-chat"
 
 CONFIDENCE_THRESHOLD = 0.6   # 置信度阈值：低于此值进入人工复核
-TOP_K_RETRIEVE = 10          # FAISS 召回候选数（粗筛）
+TOP_K_RETRIEVE = 10          # FAISS 召回候选数（粗筛，用于人工复核展示）
 TOP_K_REFINE = 5             # 送入 LLM 精排的候选数
 
 
@@ -94,17 +106,25 @@ logger = setup_logging()
 # ========================== 数据结构 ==========================
 
 @dataclass
+class RetrievalCandidate:
+    """向量召回的一个候选类别（含相似度分数）。"""
+    category: str
+    score: float
+
+
+@dataclass
 class AnnotationResult:
-    """单条商品的标注结果（含 Agent 标注与人工复核状态）。"""
+    """单条商品的标注结果（含 Agent 标注、召回候选与人工复核状态）。"""
     product: str
-    category: str                 # 最终类别（Agent 标注或人工修正后）
-    agent_category: str           # Agent 原始标注
-    confidence: float             # Agent 置信度 0~1
-    reason: str                   # 判断理由
-    candidates: List[str] = field(default_factory=list)  # 召回候选类别
-    source: str = "agent"         # 最终来源："agent" 或 "human"
-    need_review: bool = False     # 是否需要人工复核
-    reviewed: bool = False        # 是否已完成人工复核
+    category: str                       # 最终类别（Agent 标注或人工修正后）
+    agent_category: str                 # Agent 原始标注
+    confidence: float                   # Agent 置信度 0~1
+    reason: str                         # 判断理由
+    candidates: List[str] = field(default_factory=list)        # Top-5 类别名（送入 LLM）
+    top10_candidates: List[dict] = field(default_factory=list)  # Top-10 候选（含相似度，用于复核）
+    source: str = "agent"               # 最终来源："agent" 或 "human"
+    need_review: bool = False           # 是否需要人工复核
+    reviewed: bool = False              # 是否已完成人工复核
     timestamp: str = field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
     def to_dict(self) -> dict:
@@ -113,13 +133,13 @@ class AnnotationResult:
 
 # ========================== 阶段1：离线构建类别向量库 ==========================
 
-def build_or_load_category_index(categories_file: Path):
+def build_or_load_category_index(categories_file: Path, index_dir: Path = INDEX_DIR):
     """构建或加载类别 FAISS 索引；已存在则直接加载，否则从 categories.txt 构建并保存。"""
-    if INDEX_DIR.exists():
+    if index_dir.exists():
         try:
             embedding_model = get_embeddings(EMBEDDING_MODEL)
             vector_store = FAISS.load_local(
-                str(INDEX_DIR),
+                str(index_dir),
                 embedding_model,
                 allow_dangerous_deserialization=True,
             )
@@ -134,7 +154,7 @@ def build_or_load_category_index(categories_file: Path):
     embedding_model = get_embeddings(EMBEDDING_MODEL)
     docs = [Document(page_content=cat, metadata={"category": cat}) for cat in categories]
     vector_store = FAISS.from_documents(docs, embedding_model)
-    vector_store.save_local(str(INDEX_DIR))
+    vector_store.save_local(str(index_dir))
     logger.info("类别索引构建完成并已保存。")
     return vector_store
 
@@ -182,23 +202,32 @@ def build_llm():
     )
 
 
-# ========================== 阶段3：Agent 自动标注 ==========================
+# ========================== 阶段3：向量召回 + Agent 自动标注 ==========================
 
-def annotate(product: str, retriever, chain) -> AnnotationResult:
-    """两阶段标注：FAISS 粗筛召回候选 → LLM 精排 → 置信度门控 + 异常兜底。"""
+def retrieve_candidates(vector_store, product: str, k: int = TOP_K_RETRIEVE) -> List[RetrievalCandidate]:
+    """向量召回 Top-K 候选类别，带相似度分数（越高越相似）。"""
+    scored = vector_store.similarity_search_with_relevance_scores(product, k=k)
+    return [
+        RetrievalCandidate(category=doc.metadata["category"], score=round(float(score), 4))
+        for doc, score in scored
+    ]
+
+
+def annotate(product: str, vector_store, chain) -> AnnotationResult:
+    """两阶段标注：FAISS 粗筛召回 Top-10 → LLM 在 Top-5 精排 → 置信度门控 + 异常兜底。"""
     try:
-        # ---- 阶段1：向量检索（粗筛）----
-        retrieved_docs = retriever.invoke(product)
-        if not retrieved_docs:
+        # ---- 阶段1：向量检索（粗筛，召回 Top-10）----
+        top10 = retrieve_candidates(vector_store, product, k=TOP_K_RETRIEVE)
+        if not top10:
             logger.warning(f"商品 '{product}' 未召回任何候选类别")
             return _fallback(product, "未召回任何候选类别")
 
-        candidate_categories = [doc.metadata["category"] for doc in retrieved_docs[:TOP_K_REFINE]]
+        refine_candidates = [c.category for c in top10[:TOP_K_REFINE]]
 
         # ---- 阶段2：LLM 精排（Agent 标注）----
         raw = chain.invoke({
             "product": product,
-            "candidates": "\n".join(candidate_categories),
+            "candidates": "\n".join(refine_candidates),
         })
 
         # 字段完整性校验
@@ -213,20 +242,22 @@ def annotate(product: str, retriever, chain) -> AnnotationResult:
             confidence = 0.0
 
         # ---- 候选一致性校验（防 LLM 幻觉）----
-        if category not in candidate_categories and category != "未知":
+        if category not in refine_candidates and category != "未知":
             logger.warning(f"LLM 返回非候选类别 '{category}'，已修正为'未知'")
             reason = f"LLM 返回了非候选类别，已修正。原理由：{reason}"
             category = "未知"
             confidence = 0.3
 
-        need_review = confidence < CONFIDENCE_THRESHOLD
+        # 低置信度，或无法归类（"未知"），一律进入人工复核
+        need_review = confidence < CONFIDENCE_THRESHOLD or category == "未知"
         return AnnotationResult(
             product=product,
             category=category,
             agent_category=category,
             confidence=confidence,
             reason=reason,
-            candidates=candidate_categories,
+            candidates=refine_candidates,
+            top10_candidates=[asdict(c) for c in top10],
             source="agent",
             need_review=need_review,
             reviewed=False,
@@ -246,6 +277,7 @@ def _fallback(product: str, reason: str) -> AnnotationResult:
         confidence=0.0,
         reason=reason,
         candidates=[],
+        top10_candidates=[],
         source="agent",
         need_review=True,
         reviewed=False,
@@ -255,7 +287,7 @@ def _fallback(product: str, reason: str) -> AnnotationResult:
 # ========================== 阶段4：人工复核 ==========================
 
 def human_review(results: List[AnnotationResult], categories_full: List[str]) -> List[AnnotationResult]:
-    """对低置信度样本进行交互式人工复核——只处理不确定项，人力消耗最小化。"""
+    """对低置信度样本进行交互式人工复核——只处理不确定项，附 Top-10 候选供参考。"""
     pending = [r for r in results if r.need_review]
     if not pending:
         logger.info("无低置信度样本，跳过人工复核")
@@ -269,12 +301,15 @@ def human_review(results: List[AnnotationResult], categories_full: List[str]) ->
         print(f"\n商品：{r.product}")
         print(f"  Agent 标注：{r.agent_category}（置信度 {r.confidence:.2f}）")
         print(f"  理由：{r.reason}")
-        print(f"  候选类别：{', '.join(r.candidates) if r.candidates else '（无召回）'}")
+        print(f"  Top-{len(r.top10_candidates)} 候选（相似度从高到低）：")
+        for i, c in enumerate(r.top10_candidates, 1):
+            marker = " ← 送入 LLM 精排" if c["category"] in r.candidates else ""
+            print(f"    {i:2d}. {c['category']:<8s}  相似度 {c['score']:.4f}{marker}")
 
         while True:
             choice = input(
                 f"  → 回车=接受 '{r.agent_category}'；"
-                f"或输入正确类别（候选类别或全量类别，'未知'表示弃标）: "
+                f"或输入正确类别（候选/全量类别，'未知'表示弃标）: "
             ).strip()
 
             if not choice:  # 接受 Agent 标注
@@ -326,12 +361,11 @@ def print_report(results: List[AnnotationResult], elapsed: float):
     print(f"  其中人工修正: {corrected} 条")
     print(f"  总耗时: {elapsed:.2f} 秒（平均 {elapsed / total:.2f} 秒/条）")
 
-    # 对比纯人工（假设人工 30 秒/条）
     manual_time = total * 30
     speedup = manual_time / elapsed if elapsed > 0 else 0
-    saved_ratio = (total - review_count) / total if total else 0
+    review_ratio = review_count / total if total else 0
     print(f"  对比纯人工（30 秒/条）: 效率提升约 {speedup:.0f} 倍")
-    print(f"  人工介入占比: {review_count / total * 100:.1f}%（即 {saved_ratio * 100:.0f}% 样本无需人工）")
+    print(f"  人工介入占比: {review_ratio * 100:.1f}%（即 {(1 - review_ratio) * 100:.0f}% 样本无需人工）")
     print("=" * 60)
 
 
@@ -342,14 +376,15 @@ def run(products_file: Path, categories_file: Path, do_review: bool) -> List[Ann
     categories_full = _read_lines(categories_file)
 
     vector_store = build_or_load_category_index(categories_file)
-    retriever = vector_store.as_retriever(search_kwargs={"k": TOP_K_RETRIEVE})
     chain = REFINE_PROMPT | build_llm() | JsonOutputParser()
 
     products = _read_lines(products_file)
-    logger.info(f"共 {len(products)} 个商品待标注 | 模式：FAISS 召回 Top-{TOP_K_RETRIEVE} → LLM 精排 Top-{TOP_K_REFINE}")
+    logger.info(
+        f"共 {len(products)} 个商品待标注 | 模式：FAISS 召回 Top-{TOP_K_RETRIEVE} → LLM 精排 Top-{TOP_K_REFINE}"
+    )
 
     start = datetime.now()
-    results = [annotate(p, retriever, chain) for p in products]
+    results = [annotate(p, vector_store, chain) for p in products]
     elapsed = (datetime.now() - start).total_seconds()
 
     if do_review:
